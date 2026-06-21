@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
+#include <winhttp.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -1028,6 +1029,299 @@ bool Builtin_source(const vector<string>& args) {
     return true;
 }
 
+// ============================================================================
+//  ASISTENTE IA — GEMINI INTEGRADO
+// ============================================================================
+
+struct ZarAI {
+    vector<pair<string,string>> history; // {role, content}
+    string apiKey;
+    bool   initialized = false;
+};
+
+static ZarAI zarAI;
+
+// Escapar cadenas para JSON
+string JsonEscape(const string& s) {
+    string r;
+    for (unsigned char c : s) {
+        if      (c == '"')  r += "\\\"";
+        else if (c == '\\') r += "\\\\";
+        else if (c == '\n') r += "\\n";
+        else if (c == '\r') r += "\\r";
+        else if (c == '\t') r += "\\t";
+        else if (c < 0x20)  { char buf[8]; snprintf(buf, sizeof(buf), "\\u%04x", c); r += buf; }
+        else                r += c;
+    }
+    return r;
+}
+
+// Construir el JSON de petición para Gemini
+string BuildGeminiRequest(const string& systemPrompt,
+                          const vector<pair<string,string>>& hist,
+                          const string& userMsg) {
+    string body = "{\"contents\":[";
+    for (auto& [role, content] : hist)
+        body += "{\"role\":\"" + role + "\",\"parts\":[{\"text\":\"" + JsonEscape(content) + "\"}]},";
+    body += "{\"role\":\"user\",\"parts\":[{\"text\":\"" + JsonEscape(userMsg) + "\"}]}],";
+    body += "\"systemInstruction\":{\"parts\":[{\"text\":\"" + JsonEscape(systemPrompt) + "\"}]},";
+    body += "\"generationConfig\":{\"temperature\":0.7,\"maxOutputTokens\":2048}}";
+    return body;
+}
+
+// Extraer el texto de la respuesta JSON de Gemini
+string ExtractGeminiText(const string& json) {
+    // Busca el primer campo "text":"..." en la respuesta
+    for (auto marker : {string("\"text\": \""), string("\"text\":\"")}) {
+        size_t pos = json.find(marker);
+        if (pos == string::npos) continue;
+        pos += marker.size();
+        string result;
+        bool esc = false;
+        while (pos < json.size()) {
+            char c = json[pos];
+            if (esc) {
+                if      (c == 'n')  result += '\n';
+                else if (c == 't')  result += '\t';
+                else if (c == 'r')  result += '\r';
+                else if (c == '"')  result += '"';
+                else if (c == '\\') result += '\\';
+                else { result += '\\'; result += c; }
+                esc = false;
+            } else if (c == '\\') {
+                esc = true;
+            } else if (c == '"') {
+                break;
+            } else {
+                result += c;
+            }
+            pos++;
+        }
+        return result;
+    }
+    return "";
+}
+
+// Petición HTTP POST usando WinHTTP (nativo, sin dependencias externas)
+string WinHttpPost(const wstring& host, const wstring& path, const string& body) {
+    HINTERNET hSess = WinHttpOpen(L"ZAR-SHELL/2.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSess) return "";
+
+    HINTERNET hConn = WinHttpConnect(hSess, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConn) { WinHttpCloseHandle(hSess); return ""; }
+
+    HINTERNET hReq = WinHttpOpenRequest(hConn, L"POST", path.c_str(),
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hReq) { WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSess); return ""; }
+
+    WinHttpAddRequestHeaders(hReq, L"Content-Type: application/json\r\n",
+        (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+
+    BOOL ok = WinHttpSendRequest(hReq,
+        WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        (LPVOID)body.c_str(), (DWORD)body.size(),
+        (DWORD)body.size(), 0);
+
+    string response;
+    if (ok && WinHttpReceiveResponse(hReq, NULL)) {
+        DWORD avail = 0;
+        do {
+            avail = 0;
+            WinHttpQueryDataAvailable(hReq, &avail);
+            if (!avail) break;
+            vector<char> buf(avail + 1, 0);
+            DWORD read = 0;
+            WinHttpReadData(hReq, buf.data(), avail, &read);
+            response.append(buf.data(), read);
+        } while (avail > 0);
+    }
+
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hConn);
+    WinHttpCloseHandle(hSess);
+    return response;
+}
+
+// Inicializar la API key (env var o archivo de config)
+bool InitAI() {
+    if (zarAI.initialized) return true;
+
+    // 1. Variable de entorno
+    char* key = getenv("GEMINI_API_KEY");
+    if (key && strlen(key) > 0) {
+        zarAI.apiKey = key;
+    } else {
+        // 2. Archivo de config: %APPDATA%\ZarShell\config.ini
+        string configPath = GetAppDataPath() + "\\config.ini";
+        ifstream f(configPath);
+        string line;
+        while (getline(f, line)) {
+            const string prefix = "GEMINI_API_KEY=";
+            if (line.rfind(prefix, 0) == 0) {
+                zarAI.apiKey = line.substr(prefix.size());
+                // Trim whitespace/CR
+                while (!zarAI.apiKey.empty() &&
+                       (zarAI.apiKey.back() == '\r' || zarAI.apiKey.back() == ' '))
+                    zarAI.apiKey.pop_back();
+                break;
+            }
+        }
+    }
+
+    if (zarAI.apiKey.empty()) return false;
+    zarAI.initialized = true;
+    return true;
+}
+
+// Imprimir la respuesta del AI formateada en la terminal
+void PrintAIResponse(const string& text) {
+    printf("\n");
+    istringstream ss(text);
+    string line;
+    bool firstLine = true;
+    while (getline(ss, line)) {
+        if (firstLine) {
+            printf("%s┌─ ZAR-AI%s\n", CYAN, RESET);
+            firstLine = false;
+        }
+        printf("%s│%s %s\n", CYAN, RESET, line.c_str());
+    }
+    printf("%s└─%s\n\n", CYAN, RESET);
+}
+
+// Llamar a Gemini y obtener la respuesta
+string CallGemini(const string& userMsg) {
+    char cwd[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, cwd);
+
+    string systemPrompt =
+        "Eres el asistente integrado de ZAR-SHELL, una terminal de Windows desarrollada en C++ "
+        "que no depende de cmd.exe. Tu nombre es ZAR-AI. "
+        "Eres conciso, técnico y tienes actitud directa. "
+        "Respondes siempre en español a menos que el usuario pida otro idioma. "
+        "Cuando das comandos, usas la sintaxis de ZAR-SHELL (compatible con Windows + aliases Linux). "
+        "Directorio actual: " + string(cwd) + ". "
+        "Último código de salida: " + to_string(shell.lastExitCode) + ".";
+
+    string body = BuildGeminiRequest(systemPrompt, zarAI.history, userMsg);
+    string pathStr = "/v1beta/models/gemini-2.0-flash:generateContent?key=" + zarAI.apiKey;
+    wstring wPath(pathStr.begin(), pathStr.end());
+
+    string raw = WinHttpPost(L"generativelanguage.googleapis.com", wPath, body);
+    if (raw.empty()) return "";
+
+    return ExtractGeminiText(raw);
+}
+
+// ── builtin: ai ──────────────────────────────────────────────────────────────
+bool Builtin_ai(const vector<string>& args) {
+    // Verificar / cargar API key
+    if (!InitAI()) {
+        printf("%s[ZAR-AI] No hay API key configurada.%s\n", RED, RESET);
+        printf("%sCómo configurarla:%s\n", GRAY, RESET);
+        printf("  %s1) export GEMINI_API_KEY=tu_clave%s\n", YELLOW, RESET);
+        printf("  %s2) O escribe GEMINI_API_KEY=tu_clave en:%s\n", YELLOW, RESET);
+        printf("     %s%s\\config.ini%s\n", DIM, GetAppDataPath().c_str(), RESET);
+        printf("  %sObtén una clave gratis en: https://aistudio.google.com/apikey%s\n\n", DIM, RESET);
+        return true;
+    }
+
+    // ai reset — borrar historial de conversación
+    if (args.size() >= 2 && args[1] == "reset") {
+        zarAI.history.clear();
+        printf("%s[ZAR-AI] Conversación reiniciada.%s\n", GREEN, RESET);
+        return true;
+    }
+
+    // Modo inline: ai "pregunta directa"
+    if (args.size() >= 2) {
+        string query;
+        for (int i = 1; i < (int)args.size(); i++) {
+            if (i > 1) query += " ";
+            query += args[i];
+        }
+
+        printf("%s[ZAR-AI]%s procesando...\r", CYAN, RESET);
+        fflush(stdout);
+
+        string answer = CallGemini(query);
+        printf("                          \r"); // limpiar línea
+
+        if (answer.empty()) {
+            fprintf(stderr, "%s[ZAR-AI] Error: no se pudo contactar la API.%s\n", RED, RESET);
+            fprintf(stderr, "%s  Verifica tu GEMINI_API_KEY y conexión a internet.%s\n", GRAY, RESET);
+            return true;
+        }
+
+        zarAI.history.push_back({"user",  query});
+        zarAI.history.push_back({"model", answer});
+        // Limitar historial a los últimos 10 intercambios (20 mensajes)
+        while (zarAI.history.size() > 20)
+            zarAI.history.erase(zarAI.history.begin(), zarAI.history.begin() + 2);
+
+        PrintAIResponse(answer);
+        return true;
+    }
+
+    // Modo chat interactivo: solo `ai` sin argumentos
+    printf("\n%s%s╔══════════════════════════════════════════╗%s\n", BOLD, CYAN, RESET);
+    printf("%s%s║       ZAR-AI — Asistente Integrado       ║%s\n", BOLD, CYAN, RESET);
+    printf("%s%s╚══════════════════════════════════════════╝%s\n", BOLD, CYAN, RESET);
+    printf("%s  Escribe tu pregunta. 'exit' para volver.%s\n", GRAY, RESET);
+    printf("%s  'reset' para borrar el historial de chat.%s\n\n", GRAY, RESET);
+
+    // En modo chat usamos getline normal (ya estamos en modo texto)
+    DWORD origMode;
+    GetConsoleMode(hStdIn, &origMode);
+    SetConsoleMode(hStdIn, ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT
+                         | ENABLE_ECHO_INPUT | ENABLE_EXTENDED_FLAGS);
+
+    while (true) {
+        printf("%s ZAR-AI ❯%s ", MAGENTA, RESET);
+        fflush(stdout);
+
+        string query;
+        if (!getline(cin, query)) break;
+
+        // Trim
+        while (!query.empty() && isspace((unsigned char)query.back()))  query.pop_back();
+        while (!query.empty() && isspace((unsigned char)query.front())) query.erase(query.begin());
+
+        if (query.empty())                          continue;
+        if (query == "exit" || query == "salir")    break;
+        if (query == "reset") {
+            zarAI.history.clear();
+            printf("%s[ZAR-AI] Conversación reiniciada.%s\n\n", GREEN, RESET);
+            continue;
+        }
+
+        printf("\n%s[ZAR-AI]%s procesando...\r", CYAN, RESET);
+        fflush(stdout);
+
+        string answer = CallGemini(query);
+        printf("                               \r");
+
+        if (answer.empty()) {
+            fprintf(stderr, "%s[ZAR-AI] Error de conexión.%s\n\n", RED, RESET);
+            continue;
+        }
+
+        zarAI.history.push_back({"user",  query});
+        zarAI.history.push_back({"model", answer});
+        while (zarAI.history.size() > 20)
+            zarAI.history.erase(zarAI.history.begin(), zarAI.history.begin() + 2);
+
+        PrintAIResponse(answer);
+    }
+
+    // Restaurar modo de consola para las flechas del shell
+    SetConsoleMode(hStdIn, origMode);
+    printf("%s[ZAR-AI] De vuelta al shell.%s\n\n", GRAY, RESET);
+    return true;
+}
+
 // ── Despachador de builtins ───────────────────────────────────────────────────
 bool ExecuteBuiltin(const SimpleCmd& cmd) {
     if (cmd.args.empty()) return false;
@@ -1048,6 +1342,7 @@ bool ExecuteBuiltin(const SimpleCmd& cmd) {
     if (name == "kill")                return Builtin_kill(cmd.args);
     if (name == "whoami")              return Builtin_whoami(cmd.args);
     if (name == "help")                return Builtin_help(cmd.args);
+    if (name == "ai")                   return Builtin_ai(cmd.args);
     if (name == "source")              return Builtin_source(cmd.args);
     if (name == "clear" || name == "cls") { ClearScreen(); return true; }
     if (name == "exit" || name == "salir") {

@@ -4,7 +4,7 @@
 
 CXX      ?= g++
 CXXFLAGS  = -std=c++17 -O2 -Wall -Wextra
-LDFLAGS   = -static
+LDFLAGS   = -static -lwinhttp
 TARGET    = zar_shell.exe
 SRC       = src/zar_shell.cpp
 
