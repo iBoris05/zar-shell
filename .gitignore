@@ -1,0 +1,38 @@
+# Archivos compilados
+*.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+
+# Directorios de compilación
+build/
+bin/
+out/
+
+# Archivos del editor / IDE
+.vscode/
+.vs/
+*.user
+*.suo
+*.ncb
+*.sdf
+.idea/
+
+# Logs y temporales
+*.log
+session_log.txt
+
+# Historial del shell (se guarda en %APPDATA%)
+history.txt
+
+# Windows
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# MinGW / MSYS2 deps
+*.a
